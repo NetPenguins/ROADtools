@@ -28,6 +28,7 @@ from sqlalchemy.orm import sessionmaker
 
 warnings.simplefilter('ignore')
 token = None
+inputfile = None
 expiretime = None
 headers = {}
 dburl = ''
@@ -111,9 +112,8 @@ async def ratelimit():
     else:
         tokencounter -= 1
 
-
-def checktoken():
-    global token, expiretime
+async def checktoken():
+    global token, expiretime, inputfile
     if time.time() > expiretime - 300:
         auth = Authentication()
         try:
@@ -131,10 +131,27 @@ def checktoken():
             print('Refreshed token')
             return True
         elif time.time() > expiretime:
-            print('Access token is expired, but no access to refresh token! Dumping will fail')
-            return False
+            import keyboard
+            input("Press [ENTER] after you update the tokenfile OR press [ctrl+c] to cancel...")
+            with open(inputfile, 'r') as infile:
+                token = json.load(infile)
+            expiretime = time.mktime(time.strptime(token['expiresOn'].split('.')[0], '%Y-%m-%d %H:%M:%S'))
+            
+            if time.time() > expiretime:
+                print("Updated token is still expired!")
+                return checktoken()
+            else: 
+                return True
+            # print('Access token is expired, but no access to refresh token! Dumping will fail')
+            # return False
     return True
 
+async def with_token_check(task_func, *args, **kwargs):
+        while True:
+            if not await checktoken():
+                continue
+            return await task_func(*args, **kwargs)
+        
 async def dumpsingle(url, method):
     global urlcounter, tokencounter
     checktoken()
@@ -316,7 +333,7 @@ class DataDumper(object):
         i = 0
         for parent in parents:
             url = 'https://graph.windows.net/%s/%s/%s/$links/%s?api-version=%s' % (self.tenantid, objecttype, parent.objectId, linktype, self.api_version)
-            jobs.append(self.dump_l_to_db(url, method, mapping, linkname, childtbl, parent))
+            jobs.append(with_token_check(self.dump_l_to_db(url, method, mapping, linkname, childtbl, parent)))
             i += 1
             # Chunk it to avoid huge memory usage
             if i > 1000:
@@ -353,7 +370,7 @@ class DataDumper(object):
         i = 0
         for parentid, in parents:
             url = 'https://graph.windows.net/%s/%s/%s?api-version=%s&$select=strongAuthenticationDetail,objectId' % (self.tenantid, objecttype, parentid, self.api_version)
-            jobs.append(self.dump_mfa_to_db(url, method, parentid, cache))
+            jobs.append(with_token_check(self.dump_mfa_to_db(url, method, parentid, cache)))
             i += 1
             # Chunk it to avoid huge memory usage
             if i > 1000:
@@ -399,7 +416,7 @@ class DataDumper(object):
         jobs = []
         for parent in parents:
             url = 'https://graph.windows.net/%s/%s/%s/%s?api-version=%s' % (self.tenantid, objecttype, parent.objectId, linktype, self.api_version)
-            jobs.append(self.dump_lo_to_db(url, method, linkobjecttype, cache, ignore_duplicates=ignore_duplicates))
+            jobs.append(with_token_check(self.dump_lo_to_db(url, method, linkobjecttype, cache, ignore_duplicates=ignore_duplicates)))
         await asyncio.gather(*jobs)
         if len(cache) > 0:
             commit(self.session, linkobjecttype, cache, ignore=ignore_duplicates)
@@ -455,7 +472,7 @@ class DataDumper(object):
         jobs = []
         for parentid in parents:
             url = 'https://graph.windows.net/%s/%s/%s?api-version=%s' % (self.tenantid, endpoint, parentid, self.api_version)
-            jobs.append(self.dump_so_to_db(url, self.ahsession.get, dbtype, cache, ignore_duplicates=ignore_duplicates))
+            jobs.append(with_token_check(self.dump_so_to_db(url, self.ahsession.get, dbtype, cache, ignore_duplicates=ignore_duplicates)))
         await asyncio.gather(*jobs)
         if len(cache) > 0:
             commit(self.session, dbtype, cache, ignore=ignore_duplicates)
@@ -467,7 +484,7 @@ class DataDumper(object):
         jobs = []
         for parent in parents:
             url = 'https://graph.windows.net/%s/%s/%s?api-version=%s' % (self.tenantid, endpoint, parent.appId, self.api_version)
-            jobs.append(self.dump_so_to_db(url, self.ahsession.get, dbtype, cache, ignore_duplicates=ignore_duplicates))
+            jobs.append(with_token_check(self.dump_so_to_db(url, self.ahsession.get, dbtype, cache, ignore_duplicates=ignore_duplicates)))
         await asyncio.gather(*jobs)
         if len(cache) > 0:
             commit(self.session, dbtype, cache, ignore=ignore_duplicates)
@@ -479,7 +496,7 @@ class DataDumper(object):
         jobs = []
         for parent in parents:
             url = 'https://graph.windows.net/%s/roleAssignments?api-version=%s&$filter=roleDefinitionId eq \'%s\'' % (self.tenantid, self.api_version, parent.objectId)
-            jobs.append(self.dump_lo_to_db(url, self.ahsession.get, dbtype, cache))
+            jobs.append(with_token_check(self.dump_lo_to_db(url, self.ahsession.get, dbtype, cache)))
         await asyncio.gather(*jobs)
         if len(cache) > 0:
             commit(self.session, dbtype, cache)
@@ -491,7 +508,7 @@ class DataDumper(object):
         jobs = []
         for parent in parents:
             url = 'https://graph.windows.net/%s/eligibleRoleAssignments?api-version=%s&$filter=roleDefinitionId eq \'%s\'' % (self.tenantid, self.api_version, parent.objectId)
-            jobs.append(self.dump_lo_to_db(url, self.ahsession.get, dbtype, cache))
+            jobs.append(with_token_check(self.dump_lo_to_db(url, self.ahsession.get, dbtype, cache)))
         await asyncio.gather(*jobs)
         if len(cache) > 0:
             commit(self.session, dbtype, cache)
@@ -517,6 +534,8 @@ async def run(args):
         # Store this in the token as well
         token['useragent'] = auth.user_agent
 
+
+
     if not checktoken():
         return
     # Recreate DB
@@ -532,25 +551,41 @@ async def run(args):
         async with aiohttp.ClientSession() as ahsession:
             print('Starting data gathering phase 1 of 2 (collecting objects)')
             dumper.ahsession = ahsession
-            tasks = []
-            tasks.append(dumper.dump_object('users', User))
-            tasks.append(dumper.dump_object('tenantDetails', TenantDetail))
-            tasks.append(dumper.dump_object('policies', Policy))
-            tasks.append(dumper.dump_object('servicePrincipals', ServicePrincipal))
-            tasks.append(dumper.dump_object('groups', Group))
-            tasks.append(dumper.dump_object('administrativeUnits', AdministrativeUnit))
+            # tasks = []
+            # tasks.append(dumper.dump_object('users', User))
+            # tasks.append(dumper.dump_object('tenantDetails', TenantDetail))
+            # tasks.append(dumper.dump_object('policies', Policy))
+            # tasks.append(dumper.dump_object('servicePrincipals', ServicePrincipal))
+            # tasks.append(dumper.dump_object('groups', Group))
+            # tasks.append(dumper.dump_object('administrativeUnits', AdministrativeUnit))
 
-            tasks.append(dumper.dump_object('applications', Application))
-            tasks.append(dumper.dump_object('devices', Device))
-            # tasks.append(dumper.dump_object('domains', Domain))
-            tasks.append(dumper.dump_object('directoryRoles', DirectoryRole))
-            tasks.append(dumper.dump_object('roleDefinitions', RoleDefinition))
-            # tasks.append(dumper.dump_object('roleAssignments', RoleAssignment))
-            tasks.append(dumper.dump_object('contacts', Contact))
-            # tasks.append(dumper.dump_object('getAvailableExtensionProperties', ExtensionProperty, method=ahsession.post))
-            tasks.append(dumper.dump_object('oauth2PermissionGrants', OAuth2PermissionGrant))
-            tasks.append(dumper.dump_object('authorizationPolicy', AuthorizationPolicy))
-            tasks.append(dumper.dump_object('settings', DirectorySetting))
+            # tasks.append(dumper.dump_object('applications', Application))
+            # tasks.append(dumper.dump_object('devices', Device))
+            # # tasks.append(dumper.dump_object('domains', Domain))
+            # tasks.append(dumper.dump_object('directoryRoles', DirectoryRole))
+            # tasks.append(dumper.dump_object('roleDefinitions', RoleDefinition))
+            # # tasks.append(dumper.dump_object('roleAssignments', RoleAssignment))
+            # tasks.append(dumper.dump_object('contacts', Contact))
+            # # tasks.append(dumper.dump_object('getAvailableExtensionProperties', ExtensionProperty, method=ahsession.post))
+            # tasks.append(dumper.dump_object('oauth2PermissionGrants', OAuth2PermissionGrant))
+            # tasks.append(dumper.dump_object('authorizationPolicy', AuthorizationPolicy))
+            # tasks.append(dumper.dump_object('settings', DirectorySetting))
+            tasks = [
+                with_token_check(dumper.dump_object, 'users', User),
+                with_token_check(dumper.dump_object, 'tenantDetails', TenantDetail),
+                with_token_check(dumper.dump_object, 'policies', Policy),
+                with_token_check(dumper.dump_object, 'servicePrincipals', ServicePrincipal),
+                with_token_check(dumper.dump_object, 'groups', Group),
+                with_token_check(dumper.dump_object, 'administrativeUnits', AdministrativeUnit),
+                with_token_check(dumper.dump_object, 'applications', Application),
+                with_token_check(dumper.dump_object, 'devices', Device),
+                with_token_check(dumper.dump_object, 'directoryRoles', DirectoryRole),
+                with_token_check(dumper.dump_object, 'roleDefinitions', RoleDefinition),
+                with_token_check(dumper.dump_object, 'contacts', Contact),
+                with_token_check(dumper.dump_object, 'oauth2PermissionGrants', OAuth2PermissionGrant),
+                with_token_check(dumper.dump_object, 'authorizationPolicy', AuthorizationPolicy),
+                with_token_check(dumper.dump_object, 'settings', DirectorySetting)
+            ]
             await asyncio.gather(*tasks)
 
     Session = sessionmaker(bind=engine)
@@ -627,23 +662,44 @@ async def run(args):
             print('Starting data gathering phase 2 of 2 (collecting properties and relationships)')
         dumper.ahsession = ahsession
         # If we have a lot of groups, dump them separately
+        # if totalgroups <= MAX_GROUPS:
+        #     tasks.append(dumper.dump_links('groups', 'members', Group, mapping=group_mapping))
+        #     tasks.append(dumper.dump_links('groups', 'owners', Group, mapping=group_owner_mapping))
+        #     tasks.append(dumper.dump_links('administrativeUnits', 'members', AdministrativeUnit, mapping=au_mapping))
+        #     tasks.append(dumper.dump_object_expansion('devices', Device, 'registeredOwners', 'owner', User))
+        # tasks.append(dumper.dump_links('directoryRoles', 'members', DirectoryRole, mapping=role_mapping))
+        # tasks.append(dumper.dump_linked_objects('servicePrincipals', 'appRoleAssignedTo', ServicePrincipal, AppRoleAssignment, ignore_duplicates=True))
+        # tasks.append(dumper.dump_linked_objects('servicePrincipals', 'appRoleAssignments', ServicePrincipal, AppRoleAssignment, ignore_duplicates=True))
+        # tasks.append(dumper.dump_object_expansion('servicePrincipals', ServicePrincipal, 'owners', 'owner', User, mapping=owner_mapping))
+        # tasks.append(dumper.dump_object_expansion('applications', Application, 'owners', 'owner', User, mapping=owner_mapping))
+        # tasks.append(dumper.dump_custom_role_members(RoleAssignment))
+        # tasks.append(dumper.dump_eligible_role_members(EligibleRoleAssignment))
+        # if args.mfa:
+        #     tasks.append(dumper.dump_mfa('users', User, method=ahsession.get))
+        # tasks.append(dumper.dump_each(ServicePrincipal, 'applicationRefs', ApplicationRef))
+        # tasks.append(dumper.dump_keycredentials('servicePrincipals', ServicePrincipal))
+        # tasks.append(dumper.dump_keycredentials('applications', Application))
         if totalgroups <= MAX_GROUPS:
-            tasks.append(dumper.dump_links('groups', 'members', Group, mapping=group_mapping))
-            tasks.append(dumper.dump_links('groups', 'owners', Group, mapping=group_owner_mapping))
-            tasks.append(dumper.dump_links('administrativeUnits', 'members', AdministrativeUnit, mapping=au_mapping))
-            tasks.append(dumper.dump_object_expansion('devices', Device, 'registeredOwners', 'owner', User))
-        tasks.append(dumper.dump_links('directoryRoles', 'members', DirectoryRole, mapping=role_mapping))
-        tasks.append(dumper.dump_linked_objects('servicePrincipals', 'appRoleAssignedTo', ServicePrincipal, AppRoleAssignment, ignore_duplicates=True))
-        tasks.append(dumper.dump_linked_objects('servicePrincipals', 'appRoleAssignments', ServicePrincipal, AppRoleAssignment, ignore_duplicates=True))
-        tasks.append(dumper.dump_object_expansion('servicePrincipals', ServicePrincipal, 'owners', 'owner', User, mapping=owner_mapping))
-        tasks.append(dumper.dump_object_expansion('applications', Application, 'owners', 'owner', User, mapping=owner_mapping))
-        tasks.append(dumper.dump_custom_role_members(RoleAssignment))
-        tasks.append(dumper.dump_eligible_role_members(EligibleRoleAssignment))
+            tasks.extend([
+                with_token_check(dumper.dump_links, 'groups', 'members', Group, mapping=group_mapping),
+                with_token_check(dumper.dump_links, 'groups', 'owners', Group, mapping=group_owner_mapping),
+                with_token_check(dumper.dump_links, 'administrativeUnits', 'members', AdministrativeUnit, mapping=au_mapping),
+                with_token_check(dumper.dump_object_expansion, 'devices', Device, 'registeredOwners', 'owner', User)
+            ])
+        tasks.extend([
+            with_token_check(dumper.dump_links, 'directoryRoles', 'members', DirectoryRole, mapping=role_mapping),
+            with_token_check(dumper.dump_linked_objects, 'servicePrincipals', 'appRoleAssignedTo', ServicePrincipal, AppRoleAssignment, ignore_duplicates=True),
+            with_token_check(dumper.dump_linked_objects, 'servicePrincipals', 'appRoleAssignments', ServicePrincipal, AppRoleAssignment, ignore_duplicates=True),
+            with_token_check(dumper.dump_object_expansion, 'servicePrincipals', ServicePrincipal, 'owners', 'owner', User, mapping=owner_mapping),
+            with_token_check(dumper.dump_object_expansion, 'applications', Application, 'owners', 'owner', User, mapping=owner_mapping),
+            with_token_check(dumper.dump_custom_role_members, RoleAssignment),
+            with_token_check(dumper.dump_eligible_role_members, EligibleRoleAssignment),
+            with_token_check(dumper.dump_each, ServicePrincipal, 'applicationRefs', ApplicationRef),
+            with_token_check(dumper.dump_keycredentials, 'servicePrincipals', ServicePrincipal),
+            with_token_check(dumper.dump_keycredentials, 'applications', Application)
+        ])
         if args.mfa:
-            tasks.append(dumper.dump_mfa('users', User, method=ahsession.get))
-        tasks.append(dumper.dump_each(ServicePrincipal, 'applicationRefs', ApplicationRef))
-        tasks.append(dumper.dump_keycredentials('servicePrincipals', ServicePrincipal))
-        tasks.append(dumper.dump_keycredentials('applications', Application))
+            tasks.append(with_token_check(dumper.dump_mfa, 'users', User, method=ahsession.get))
         await asyncio.gather(*tasks)
     dbsession.commit()
 
@@ -654,15 +710,22 @@ async def run(args):
             dumper.ahsession = ahsession
             queue = asyncio.Queue(maxsize=100)
             # Start the workers
-            workers = []
-            for i in range(100):
-                workers.append(asyncio.ensure_future(queue_processor(queue)))
+            # workers = []
+            # for i in range(100):
+            #     workers.append(asyncio.ensure_future(queue_processor(queue)))
 
-            tasks.append(dumper.dump_links_with_queue(queue, 'devices', 'registeredOwners', Device, mapping=device_link_mapping))
-            tasks.append(dumper.dump_links_with_queue(queue, 'groups', 'members', Group, mapping=group_link_mapping))
-            tasks.append(dumper.dump_links_with_queue(queue, 'groups', 'owners', Group, mapping=group_owner_link_mapping))
-            tasks.append(dumper.dump_links_with_queue(queue, 'administrativeUnits', 'members', AdministrativeUnit, mapping=au_link_mapping))
+            # tasks.append(dumper.dump_links_with_queue(queue, 'devices', 'registeredOwners', Device, mapping=device_link_mapping))
+            # tasks.append(dumper.dump_links_with_queue(queue, 'groups', 'members', Group, mapping=group_link_mapping))
+            # tasks.append(dumper.dump_links_with_queue(queue, 'groups', 'owners', Group, mapping=group_owner_link_mapping))
+            # tasks.append(dumper.dump_links_with_queue(queue, 'administrativeUnits', 'members', AdministrativeUnit, mapping=au_link_mapping))
+            workers = [asyncio.ensure_future(queue_processor(queue)) for _ in range(100)]
 
+            tasks.extend([
+                with_token_check(dumper.dump_links_with_queue, queue, 'devices', 'registeredOwners', Device, mapping=device_link_mapping),
+                with_token_check(dumper.dump_links_with_queue, queue, 'groups', 'members', Group, mapping=group_link_mapping),
+                with_token_check(dumper.dump_links_with_queue, queue, 'groups', 'owners', Group, mapping=group_owner_link_mapping),
+                with_token_check(dumper.dump_links_with_queue, queue, 'administrativeUnits', 'members', AdministrativeUnit, mapping=au_link_mapping)
+            ])
             await asyncio.gather(*tasks)
             await queue.join()
             for worker_task in workers:
@@ -699,34 +762,44 @@ def getargs(gather_parser):
                                 help='Custom user agent to use. By default aiohttp default user agent is used, and python-requests is used for token renewal')
 
 def main(args=None):
-    global token, headers, dburl, urlcounter
-    if args is None:
-        parser = argparse.ArgumentParser(add_help=True, description='ROADrecon - Gather Azure AD information', formatter_class=argparse.RawDescriptionHelpFormatter)
-        getargs(parser)
-        args = parser.parse_args()
-        if len(sys.argv) < 2:
-            parser.print_help()
-            sys.exit(1)
-    if args.tokens_stdin:
-        token = json.loads(sys.stdin.read())
-    else:
-        with open(args.tokenfile, 'r') as infile:
-            token = json.load(infile)
-    if not ':/' in args.database:
-        if args.database[0] != '/':
-            dburl = 'sqlite:///' + os.path.join(os.getcwd(), args.database)
+    global token, headers, dburl, urlcounter, inputfile
+    try:
+        if args is None:
+            parser = argparse.ArgumentParser(add_help=True, description='ROADrecon - Gather Azure AD information', formatter_class=argparse.RawDescriptionHelpFormatter)
+            getargs(parser)
+            args = parser.parse_args()
+            if len(sys.argv) < 2:
+                parser.print_help()
+                sys.exit(1)
+        if args.tokens_stdin:
+            token = json.loads(sys.stdin.read())
         else:
-            dburl = 'sqlite:///' + args.database
-    else:
-        dburl = args.database
+            inputfile = args.tokenfile
+            with open(args.tokenfile, 'r') as infile:
+                token = json.load(infile)
+        if not ':/' in args.database:
+            if args.database[0] != '/':
+                dburl = 'sqlite:///' + os.path.join(os.getcwd(), args.database)
+            else:
+                dburl = 'sqlite:///' + args.database
+        else:
+            dburl = args.database
 
-    headers['Authorization'] = '%s %s' % (token['tokenType'], token['accessToken'])
+        headers['Authorization'] = '%s %s' % (token['tokenType'], token['accessToken'])
 
-    seconds = time.perf_counter()
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(run(args))
-    elapsed = time.perf_counter() - seconds
-    print("ROADrecon gather executed in {0:0.2f} seconds and issued {1} HTTP requests.".format(elapsed, urlcounter))
+        seconds = time.perf_counter()
+        loop = asyncio.get_event_loop()
+
+        loop.run_until_complete(run(args))
+        elapsed = time.perf_counter() - seconds
+        print("ROADrecon gather executed in {0:0.2f} seconds and issued {1} HTTP requests.".format(elapsed, urlcounter))
+    except asyncio.CancelledError:
+        print("Tasks were cancelled.")
+    except KeyboardInterrupt:
+        print("\nGoodbye!")
+        exit(0)
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
